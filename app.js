@@ -1,4 +1,20 @@
-
+/**
+ * ClassPilot Bolt Agent (JavaScript / ESM) — Gemini version
+ *
+ * Handles messages in Slack, reasons via Gemini about which MCP tool to call,
+ * and replies using Block Kit with a "mark resolved" feedback row.
+ *
+ * Requires:
+ *   npm install @slack/bolt @google/genai @modelcontextprotocol/sdk dotenv
+ *
+ * .env:
+ *   SLACK_BOT_TOKEN=xoxb-...
+ *   SLACK_APP_TOKEN=xapp-...
+ *   GEMINI_API_KEY=your-google-ai-studio-key
+ *
+ * Note: package.json must have "type": "module".
+ * Run:  node app.js   (it auto-spawns mcpServer.js as a subprocess)
+ */
 
 import "dotenv/config";
 import pkg from "@slack/bolt";
@@ -15,7 +31,7 @@ const app = new App({
 });
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = "gemini-3.5-flash";
+const MODEL = "gemini-flash-latest";
 
 // Gemini function declarations (equivalent to Anthropic's tools schema).
 const FUNCTION_DECLARATIONS = [
@@ -246,8 +262,31 @@ app.message(async ({ message, say }) => {
   const userText = message.text ?? "";
   if (!userText.trim()) return;
 
-  const { text, topic, subtopic } = await runAgent(userText);
-  await say({ blocks: buildAnswerBlocks(text, topic, subtopic), text });
+  try {
+    const { text, topic, subtopic } = await runAgent(userText);
+
+    // If the agent came back with genuinely nothing useful (no tool match and
+    // no real answer text), send an honest "not in our database" message
+    // instead of an empty or confusing reply.
+    if (!text || !text.trim()) {
+      await say(
+        "I couldn't find anything on that in our question bank, and I'm not confident enough to answer from general knowledge. Try rephrasing, or ask your lecturer/class rep directly — I've logged this so it shows up in the topic-gap summary."
+      );
+      await callMcpTool("log_topic_gap", {
+        topic: topic || "Unmatched",
+        subtopic: subtopic || "Unmatched",
+        resolved: false,
+      }).catch(() => {}); // best-effort log; don't let a logging failure mask the real reply
+      return;
+    }
+
+    await say({ blocks: buildAnswerBlocks(text, topic, subtopic), text });
+  } catch (err) {
+    console.error("Error handling message:", err);
+    await say(
+      "Sorry, something went wrong on my end processing that question (server error). Give it another try in a moment — if it keeps happening, let whoever manages this workspace know."
+    );
+  }
 });
 
 app.action("mark_resolved", async ({ ack, body }) => {
@@ -266,20 +305,25 @@ app.action("mark_unresolved", async ({ ack, body }) => {
 
 app.command("/study-gaps", async ({ ack, respond }) => {
   await ack();
-  const result = await callMcpTool("get_topic_gap_summary", {});
-  const gaps = extractJson(result);
+  try {
+    const result = await callMcpTool("get_topic_gap_summary", {});
+    const gaps = extractJson(result);
 
-  if (!gaps || gaps.length === 0) {
-    await respond("No unresolved topic gaps logged yet.");
-    return;
+    if (!gaps || gaps.length === 0) {
+      await respond("No unresolved topic gaps logged yet.");
+      return;
+    }
+
+    const lines = ["*Top unresolved topics:*"];
+    for (const g of gaps) {
+      lines.push(`• ${g.topic_subtopic} — ${g.unresolved_count} unresolved`);
+    }
+
+    await respond(lines.join("\n"));
+  } catch (err) {
+    console.error("Error fetching topic gap summary:", err);
+    await respond("Sorry, I hit a server error pulling the topic-gap summary. Try again in a moment.");
   }
-
-  const lines = ["*Top unresolved topics:*"];
-  for (const g of gaps) {
-    lines.push(`• ${g.topic_subtopic} — ${g.unresolved_count} unresolved`);
-  }
-
-  await respond(lines.join("\n"));
 });
 
 // Minimal HTTP server so uptime pingers (e.g. UptimeRobot) can keep a
