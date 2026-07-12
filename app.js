@@ -31,7 +31,7 @@ const app = new App({
 });
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = "gemini-3.5-flash";
+const MODEL = "gemini-flash-latest";
 
 // Gemini function declarations (equivalent to Anthropic's tools schema).
 const FUNCTION_DECLARATIONS = [
