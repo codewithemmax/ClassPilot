@@ -84,6 +84,9 @@ async function getMcpClient() {
   const transport = new StdioClientTransport({
     command: "node",
     args: ["mcpServer.js"],
+    env: process.env, // must be explicit — the subprocess does not
+                       // automatically inherit parent env vars on all platforms,
+                       // which is why this worked locally but failed on Render.
   });
 
   const client = new Client({ name: "classpilot-agent", version: "1.0.0" }, { capabilities: {} });
