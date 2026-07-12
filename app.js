@@ -1,25 +1,26 @@
 /**
- * ClassPilot Bolt Agent (JavaScript / ESM) — Gemini version
+ * ClassPilot Bolt Agent (JavaScript / ESM) — Groq version
  *
- * Handles messages in Slack, reasons via Gemini about which MCP tool to call,
- * and replies using Block Kit with a "mark resolved" feedback row.
+ * Handles messages in Slack, reasons via Groq (Llama 3.3 70B) about which MCP
+ * tool to call, and replies using Block Kit with a "mark resolved" feedback row.
  *
  * Requires:
- *   npm install @slack/bolt @google/genai @modelcontextprotocol/sdk dotenv
+ *   npm install @slack/bolt groq-sdk @modelcontextprotocol/sdk dotenv
  *
  * .env:
  *   SLACK_BOT_TOKEN=xoxb-...
  *   SLACK_APP_TOKEN=xapp-...
- *   GEMINI_API_KEY=your-google-ai-studio-key
+ *   GROQ_API_KEY=gsk_...
  *
  * Note: package.json must have "type": "module".
  * Run:  node app.js   (it auto-spawns mcpServer.js as a subprocess)
  */
 
 import "dotenv/config";
+import http from "http";
 import pkg from "@slack/bolt";
 const { App, LogLevel } = pkg;
-import { GoogleGenAI } from "@google/genai";
+import Groq from "groq-sdk";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -30,47 +31,56 @@ const app = new App({
   logLevel: LogLevel.INFO,
 });
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = "gemini-flash-latest";
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const MODEL = "llama-3.3-70b-versatile";
 
-// Gemini function declarations (equivalent to Anthropic's tools schema).
-const FUNCTION_DECLARATIONS = [
+// OpenAI-format tool schema (Groq is OpenAI-compatible).
+const TOOLS = [
   {
-    name: "search_questions",
-    description: "Search the question bank for entries matching a topic or keyword.",
-    parametersJsonSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string" },
-        course_code: { type: "string" },
+    type: "function",
+    function: {
+      name: "search_questions",
+      description: "Search the question bank for entries matching a topic or keyword.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          course_code: { type: "string" },
+        },
+        required: ["query"],
       },
-      required: ["query"],
     },
   },
   {
-    name: "get_formula",
-    description: "Retrieve the formula reference for a given topic.",
-    parametersJsonSchema: {
-      type: "object",
-      properties: {
-        topic: { type: "string" },
-        course_code: { type: "string" },
+    type: "function",
+    function: {
+      name: "get_formula",
+      description: "Retrieve the formula reference for a given topic.",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: { type: "string" },
+          course_code: { type: "string" },
+        },
+        required: ["topic"],
       },
-      required: ["topic"],
     },
   },
   {
-    name: "log_topic_gap",
-    description: "Log whether a student's question on a topic/subtopic was resolved.",
-    parametersJsonSchema: {
-      type: "object",
-      properties: {
-        topic: { type: "string" },
-        subtopic: { type: "string" },
-        resolved: { type: "boolean" },
-        course_code: { type: "string" },
+    type: "function",
+    function: {
+      name: "log_topic_gap",
+      description: "Log whether a student's question on a topic/subtopic was resolved.",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: { type: "string" },
+          subtopic: { type: "string" },
+          resolved: { type: "boolean" },
+          course_code: { type: "string" },
+        },
+        required: ["topic", "subtopic", "resolved"],
       },
-      required: ["topic", "subtopic", "resolved"],
     },
   },
 ];
@@ -84,9 +94,7 @@ async function getMcpClient() {
   const transport = new StdioClientTransport({
     command: "node",
     args: ["mcpServer.js"],
-    env: process.env, // must be explicit — the subprocess does not
-                       // automatically inherit parent env vars on all platforms,
-                       // which is why this worked locally but failed on Render.
+    env: process.env, // must be explicit — subprocess doesn't auto-inherit on all platforms
   });
 
   const client = new Client({ name: "classpilot-agent", version: "1.0.0" }, { capabilities: {} });
@@ -109,17 +117,14 @@ function extractJson(toolResult) {
   }
 }
 
-// Slack's section block has a hard 3000-character limit on `text`. Long
-// Gemini answers can exceed this, which causes an `invalid_blocks` API error
-// and silently drops the whole message. Split into multiple section blocks
-// instead of truncating, so long formula explanations still come through.
+// Slack's section block has a hard 3000-character limit on `text`. Split
+// long answers into multiple section blocks instead of truncating.
 function chunkText(text, maxLen = 2900) {
   const chunks = [];
   let remaining = text;
   while (remaining.length > maxLen) {
-    // Prefer to split on a paragraph or line break near the limit, not mid-word.
     let splitAt = remaining.lastIndexOf("\n", maxLen);
-    if (splitAt < maxLen * 0.5) splitAt = maxLen; // fallback: hard split
+    if (splitAt < maxLen * 0.5) splitAt = maxLen;
     chunks.push(remaining.slice(0, splitAt));
     remaining = remaining.slice(splitAt).trimStart();
   }
@@ -165,95 +170,69 @@ function buildAnswerBlocks(answerText, topic, subtopic) {
 const SYSTEM_PROMPT = `You are ClassPilot, a study assistant for engineering students, running inside Slack.
 
 CRITICAL — Slack formatting rules:
-Slack messages use "mrkdwn", NOT standard Markdown and NOT LaTeX. Follow these rules exactly:
-- Never use $$...$$ or $...$ for math. Write formulas as plain text, e.g. *W = m·R·T·ln(p2/p1)*, or put them inside a code block using triple backticks.
-- Never use ### or ## headers. If you need a section label, put it on its own line in *bold*.
-- Use *single asterisks* for bold (NOT **double asterisks**).
-- Use "-" or "•" for bullet points, never numbered Markdown headers.
-- Keep every formula readable as plain text or inside a code block, never as LaTeX.
+Slack uses "mrkdwn", NOT standard Markdown and NOT LaTeX. Follow these exactly:
+- Never use $$...$$ or $...$ for math. Write formulas as plain text, e.g. *W = m·R·T·ln(p2/p1)*, or inside a code block using triple backticks.
+- Never use ### or ## headers. For a section label, put it on its own line in *bold*.
+- Use *single asterisks* for bold, NOT **double**.
+- Use "-" or "•" for bullets, never numbered Markdown headers.
+- Keep every formula as plain text or inside a code block, never LaTeX.
 
 CRITICAL — Always use your tools:
-For every student question you MUST call search_questions first, even if you already know the answer, so the question is logged for topic-gap tracking (the core purpose of this tool for lecturers and class reps). Only skip it if the message is clearly not academic (e.g. a greeting).
-If search_questions returns no strong match you may also call get_formula or answer from your own knowledge — but always identify a topic and subtopic based on the question's subject, even if the tools returned nothing, so gap tracking has something meaningful to log.
+For every student question you MUST call search_questions first, even if you already know the answer, so the question gets logged for topic-gap tracking (the core purpose for lecturers and class reps). Only skip it if the message is clearly not academic (e.g. a greeting).
+If search_questions returns no strong match, you may also call get_formula or answer from your own knowledge — but always identify a topic and subtopic based on the question's subject, even if the tools returned nothing, so gap tracking has something meaningful to log.
 
 Keep answers concise and student-friendly.`;
 
 /**
- * Runs a manual tool-calling loop with Gemini.
- * We drive the loop ourselves (rather than automatic function calling) so we can
- * capture topic/subtopic from tool results for gap tracking.
+ * Runs a manual tool-calling loop with Groq (OpenAI-style tool_calls).
  */
 async function runAgent(userText) {
-  // Gemini conversation history: array of {role, parts}
-  const contents = [{ role: "user", parts: [{ text: userText }] }];
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: userText },
+  ];
 
   let topic = "General";
   let subtopic = "Unspecified";
 
-  // Loop until the model stops requesting function calls (cap iterations for safety)
   for (let step = 0; step < 5; step++) {
-    const response = await ai.models.generateContent({
+    const response = await groq.chat.completions.create({
       model: MODEL,
-      contents,
-      config: {
-        systemInstruction: SYSTEM_PROMPT,
-        tools: [{ functionDeclarations: FUNCTION_DECLARATIONS }],
-      },
+      messages,
+      tools: TOOLS,
     });
 
-    const functionCalls = response.functionCalls ?? [];
+    const message = response.choices[0].message;
+    const toolCalls = message.tool_calls ?? [];
 
-    if (functionCalls.length === 0) {
-      // No more tool calls — return final text.
-      return { text: response.text ?? "", topic, subtopic };
+    if (toolCalls.length === 0) {
+      return { text: message.content ?? "", topic, subtopic };
     }
 
-    // Record the model's turn verbatim so thoughtSignature (required by
-    // Gemini for tool use) and any thought/text parts are preserved.
-    // For any functionCall part missing a signature (happens on the 2nd+
-    // parallel call), inject Google's documented placeholder to pass validation.
-    const modelContent = response.candidates?.[0]?.content;
-    if (modelContent) {
-      if (Array.isArray(modelContent.parts)) {
-        for (const part of modelContent.parts) {
-          if (part.functionCall && !part.thoughtSignature) {
-            part.thoughtSignature = "skip_thought_signature_validator";
-          }
-        }
-      }
-      contents.push(modelContent);
-    } else {
-      contents.push({
-        role: "model",
-        parts: functionCalls.map((fc) => ({
-          functionCall: { name: fc.name, args: fc.args },
-          thoughtSignature: "skip_thought_signature_validator",
-        })),
-      });
-    }
+    // Record the assistant's tool-call turn.
+    messages.push(message);
 
-    // Execute each requested tool via MCP and build the function-response turn.
-    const responseParts = [];
-    for (const fc of functionCalls) {
-      const result = await callMcpTool(fc.name, fc.args);
+    // Execute each requested tool via MCP and append tool results.
+    for (const toolCall of toolCalls) {
+      const fnName = toolCall.function.name;
+      const args = JSON.parse(toolCall.function.arguments || "{}");
+      const result = await callMcpTool(fnName, args);
+      const parsed = extractJson(result);
 
-      if (fc.name === "search_questions" || fc.name === "get_formula") {
-        const parsed = extractJson(result);
+      if (fnName === "search_questions" || fnName === "get_formula") {
         if (Array.isArray(parsed) && parsed.length > 0) {
           topic = parsed[0].topic ?? topic;
           subtopic = parsed[0].subtopic ?? subtopic;
         }
       }
 
-      responseParts.push({
-        functionResponse: {
-          name: fc.name,
-          response: { result: extractJson(result) ?? result },
-        },
+      messages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        name: fnName,
+        content: JSON.stringify(parsed ?? result),
       });
     }
-
-    contents.push({ role: "user", parts: responseParts });
   }
 
   return { text: "Sorry, I couldn't complete that in time. Try rephrasing?", topic, subtopic };
@@ -268,9 +247,6 @@ app.message(async ({ message, say }) => {
   try {
     const { text, topic, subtopic } = await runAgent(userText);
 
-    // If the agent came back with genuinely nothing useful (no tool match and
-    // no real answer text), send an honest "not in our database" message
-    // instead of an empty or confusing reply.
     if (!text || !text.trim()) {
       await say(
         "I couldn't find anything on that in our question bank, and I'm not confident enough to answer from general knowledge. Try rephrasing, or ask your lecturer/class rep directly — I've logged this so it shows up in the topic-gap summary."
@@ -279,7 +255,7 @@ app.message(async ({ message, say }) => {
         topic: topic || "Unmatched",
         subtopic: subtopic || "Unmatched",
         resolved: false,
-      }).catch(() => {}); // best-effort log; don't let a logging failure mask the real reply
+      }).catch(() => {});
       return;
     }
 
@@ -329,12 +305,7 @@ app.command("/study-gaps", async ({ ack, respond }) => {
   }
 });
 
-// Minimal HTTP server so uptime pingers (e.g. UptimeRobot) can keep a
-// free-tier host awake. Bolt runs in Socket Mode (outbound WebSocket) and does
-// not otherwise listen for inbound HTTP, so without this there is nothing to ping.
-// Render sets the PORT env var automatically; default to 3000 locally.
-import http from "http";
-
+// Minimal HTTP server so uptime pingers can keep a free-tier host awake.
 const PORT = process.env.PORT || 3000;
 http
   .createServer((req, res) => {
@@ -347,5 +318,5 @@ http
 
 (async () => {
   await app.start();
-  console.log("⚡️ ClassPilot is running (Gemini)!");
+  console.log("⚡️ ClassPilot is running (Groq)!");
 })();

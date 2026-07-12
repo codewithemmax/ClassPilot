@@ -9,7 +9,7 @@
     "start:mcp": "node mcpServer.js"
   },
   "dependencies": {
-    "@google/genai": "^1.9.0",
+    "groq-sdk": "^0.7.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@slack/bolt": "^4.0.0",
     "@supabase/supabase-js": "^2.45.0",
