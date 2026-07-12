@@ -74,8 +74,9 @@ Student (Slack channel/DM)
 
 ```
 classpilot/
-├── app.js           # Bolt agent — message handling, Gemini reasoning loop, Block Kit UI
-├── mcpServer.js     # MCP server exposing the four tools, backed by Supabase
+├── app.js           # Bolt agent — message handling, Gemini reasoning loop, Block Kirt UI
+├── mcpServer.js     # MCP server expo
+ing the four tools, backed by Supabase
 ├── package.json
 ├── .env.example     # Copy to .env and fill in real credentials
 └── README.md

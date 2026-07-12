@@ -1,4 +1,5 @@
 
+
 import "dotenv/config";
 import pkg from "@slack/bolt";
 const { App, LogLevel } = pkg;
@@ -89,12 +90,34 @@ function extractJson(toolResult) {
   }
 }
 
+// Slack's section block has a hard 3000-character limit on `text`. Long
+// Gemini answers can exceed this, which causes an `invalid_blocks` API error
+// and silently drops the whole message. Split into multiple section blocks
+// instead of truncating, so long formula explanations still come through.
+function chunkText(text, maxLen = 2900) {
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > maxLen) {
+    // Prefer to split on a paragraph or line break near the limit, not mid-word.
+    let splitAt = remaining.lastIndexOf("\n", maxLen);
+    if (splitAt < maxLen * 0.5) splitAt = maxLen; // fallback: hard split
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  if (remaining.length > 0) chunks.push(remaining);
+  return chunks;
+}
+
 function buildAnswerBlocks(answerText, topic, subtopic) {
+  const textChunks = chunkText(answerText);
+
+  const answerBlocks = textChunks.map((chunk) => ({
+    type: "section",
+    text: { type: "mrkdwn", text: chunk },
+  }));
+
   return [
-    {
-      type: "section",
-      text: { type: "mrkdwn", text: answerText },
-    },
+    ...answerBlocks,
     {
       type: "context",
       elements: [{ type: "mrkdwn", text: `Topic: *${topic}* · Subtopic: *${subtopic}*` }],
